@@ -10,7 +10,7 @@ pip3 install --break-system-packages minimalmodbus
 
 
 
-also PV as separated script  = inverter.py
+also PV as separated script  = pv_service.py
 
 
 Runs on ttyUSB0
