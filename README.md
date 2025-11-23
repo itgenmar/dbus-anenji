@@ -5,6 +5,8 @@ anenji invertor to venus os as multiplus = multiplus.py = Only Inverter side no 
 
 Download the folder in  
 /data/etc/
+
+
 opkg update
 opkg install python3-pip
 pip3 install minimalmodbus
