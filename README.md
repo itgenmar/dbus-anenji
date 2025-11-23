@@ -3,18 +3,27 @@
 anenji invertor to venus os as multiplus = multiplus.py = Only Inverter side no controls
 
 
-mkdir -p /data/venus-sumry-dbus/ext
-cp -r /opt/victronenergy/velib_python /data/venus-sumry-dbus/ext/
-opkg install python3 python3-pyserial
-pip3 install --break-system-packages minimalmodbus
+Download the folder in  
+/data/etc/
+opkg update
+opkg install python3-pip
+pip3 install minimalmodbus
+ 
+Fiind your TTYUSB and change in the script:
 
+this version runs on ttyUSB1 just do nano and change it in the main dbus multi emulator
 
+for the moment expose only inverter and ac input outpput. 
 
-also PV as separated script  = pv_service.py
+If someone has any experience to introduce the pv input please do. 
+Also I have notice that if you are using dbus serial baterry you need to disable that in the config of the serialbattery with EXCLUDED_DEVICES = /dev/ttyUSB1 (change it to your port)
 
+I have notice that the inverter doesnt show the correct values on DC if you turn it on with the fans one. i have used a swith and disabke them at startup (before connecting the battery,pv or ac)
 
-Runs on ttyUSB0
+Hope this helps 
 
+Marius...
+ 
 RS485 - USB
 
 <img width="784" height="314" alt="image" src="https://github.com/user-attachments/assets/7164f96e-e199-419f-8bc2-9f34a1ec824a" />
