@@ -1,32 +1,116 @@
-# dbus-anenji
+dbus-anenji
 
-anenji invertor to venus os as multiplus = multiplus.py = Only Inverter side no controls
+DBus interface for Anenji inverters on Venus OS, acting as a MultiPlus emulator (multiplus.py).
+This implementation currently exposes inverter status, AC input, and AC output, with no control functions.
 
+📦 Installation
+1. Copy Files
 
-Download the folder in  
+Upload the project folder to:
+
 /data/etc/
 
 
+(/data persists across reboots on Venus OS.)
+
+2. Install Required Packages
 opkg update
 opkg install python3-pip
 pip3 install minimalmodbus
- 
-Fiind your TTYUSB and change in the script:
 
-this version runs on ttyUSB1 just do nano and change it in the main dbus multi emulator
+3. Configure the Serial Port
 
-for the moment expose only inverter and ac input outpput. 
+Identify your USB–RS485 device:
 
-If someone has any experience to introduce the pv input please do. 
-Also I have notice that if you are using dbus serial baterry you need to disable that in the config of the serialbattery with EXCLUDED_DEVICES = /dev/ttyUSB1 (change it to your port)
+ls -l /dev/ttyUSB*
 
-I have notice that the inverter doesnt show the correct values on DC if you turn it on with the fans one. i have used a swith and disabke them at startup (before connecting the battery,pv or ac)
 
-Hope this helps 
+Then edit the main emulator script:
 
-Marius...
- 
-RS485 - USB
+nano multiplus.py
+
+
+Default device is:
+
+/dev/ttyUSB1
+
+
+Change this line to match your environment.
+
+⚠️ DBus Serial Battery Conflict
+
+If you are also running dbus-serialbattery, you must prevent it from using the same USB port.
+
+In the serialbattery configuration, set:
+
+EXCLUDED_DEVICES = /dev/ttyUSB1
+
+(Adjust the device tty if yours is different.)
+
+Once all is completed run ./install.sh
+
+🔧 Known Issues
+Incorrect DC Values at Startup
+
+Some Anenji inverters report incorrect DC readings if they start while the internal fans are running.
+
+Workaround used:
+
+Install a switch to disable fans at startup
+
+Allow the inverter to boot first
+
+Re-enable fans after battery / PV / AC are connected
+
+This ensures accurate DC voltage reporting.
+
+🌞 PV Input (Not Implemented Yet)
+
+The current version does not expose PV input data.
+If anyone has Modbus register details for the Anenji PV side, contributions are welcome.
+
+🧰 Hardware Setup
+
+The inverter communicates via RS485 → USB.
+
+Example adapter setup (see images in repository):
+
+TX/RX A/B connected to inverter’s RS485 port
+
+USB connected to the Venus OS device (e.g., Raspberry Pi / GX device)
+
+✔️ Features Implemented
+Feature	Status
+Inverter output	✅ Working
+AC input	✅ Working
+AC output	✅ Working
+DC voltage/current	⚠️ Inaccurate at startup (see notes)
+PV input	❌ Not implemented
+Control functions (on/off, charge, etc.)	❌ Not implemented
+📄 Example Directory Structure
+/data/etc/dbus-anenji/
+│
+├── multiplus.py
+├── settings.json
+├── README.md
+└── other supporting scripts…
+
+🤝 Contributions
+
+Pull requests and register maps are welcome!
+The goal is to eventually support:
+
+PV input
+
+Charge/Discharge control
+
+Full MultiPlus emulation
+
+Improved Modbus error handling
+
+👤 Author
+
+Created by Marius.
 
 <img width="784" height="314" alt="image" src="https://github.com/user-attachments/assets/7164f96e-e199-419f-8bc2-9f34a1ec824a" />
 <img width="781" height="311" alt="image" src="https://github.com/user-attachments/assets/698b4820-7cbc-49e4-9ebb-b12cc18e8b68" />
