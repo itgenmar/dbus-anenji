@@ -1,8 +1,8 @@
 dbus-anenji
 
 DBus interface for Anenji inverters on Venus OS, acting as a MultiPlus emulator (multiplus.py).
-This implementation currently exposes inverter status, AC input, and AC output, with no control functions.
-PV added - wrong daily calculation reported in VRM. 
+This implementation currently exposes inverter status, AC input, and AC output, with control functions.
+PV added - corect daily calculation reported in VRM. 
 
 
 📦 Installation
