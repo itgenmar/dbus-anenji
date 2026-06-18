@@ -9,6 +9,10 @@ Final Anenji -> Victron VE.Bus emulator (Victron-compatible outputs)
 - PV daily accumulator persistence
 - Safe Modbus write wrapper and validation
 - Designed for Venus OS / Linux
+
+NOTE (VRM Grid voltage fix):
+- VRM/Grid tile reads /Ac/In/1/*, not only /Ac/ActiveIn/*
+- This file now publishes /Ac/In/1/* and drives Connected/ActiveInput from AC-in voltage presence.
 """
 
 import os
@@ -18,10 +22,16 @@ import logging
 import signal
 from time import time, sleep
 from threading import Event
+from datetime import datetime
 
 import dbus
 import dbus.mainloop.glib
 from gi.repository import GLib
+
+# ---- Create independent D-Bus connections (needed when exporting two services in one process) ----
+class SystemBus(dbus.bus.BusConnection):
+    def __new__(cls):
+        return dbus.bus.BusConnection.__new__(cls, dbus.bus.BusConnection.TYPE_SYSTEM)
 
 # allow velib_python in ext/
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -30,12 +40,6 @@ from vedbus import VeDbusService  # vendored velib
 
 import minimalmodbus
 import serial
-
-# ---- Create true independent dbus connections (same pattern as Victron dbusmonitor.py) ----
-class SystemBus(dbus.bus.BusConnection):
-    def __new__(cls):
-        return dbus.bus.BusConnection.__new__(cls, dbus.bus.BusConnection.TYPE_SYSTEM)
-
 
 # ---------------- CONFIG ----------------
 ANENJI_PORT    = os.environ.get("ANENJI_PORT", "/dev/ttyUSB3")
@@ -50,18 +54,19 @@ PRODUCT_NAME   = os.environ.get("PRODUCT_NAME", "MultiPlus-II (Anenji bridge)")
 FIRMWARE_VER   = os.environ.get("FIRMWARE_VER", "v4.0-anenji-final")
 DEVICE_INSTANCE= int(os.environ.get("ANENJI_DEVICE_INSTANCE", "28"))
 
+# MPPT (SolarCharger) service - for VRM/SystemCalc solar accounting
+PV_SERVICE_NAME    = os.environ.get("PV_SERVICE_NAME", "com.victronenergy.solarcharger.anenji")
+PV_DEVICE_INSTANCE = int(os.environ.get("PV_DEVICE_INSTANCE", "4500"))
+PV_PRODUCT_ID      = int(os.environ.get("PV_PRODUCT_ID", "4500"))
+PV_PRODUCT_NAME    = os.environ.get("PV_PRODUCT_NAME", "Solar Charger PV Yield")
+PV_HISTORY_FILE    = os.environ.get("PV_HISTORY_FILE", os.path.join(BASE_DIR, "pv_history.json"))
+
 PHASE_COUNT        = int(os.environ.get("PHASE_COUNT", "1"))
 INVERTER_MAX_POWER = int(os.environ.get("ANENJI_INV_MAX_POWER", "3000"))
 
-# SolarCharger (MPPT) service (optional: makes an MPPT device appear)
-PV_SERVICE_NAME    = os.environ.get("PV_SERVICE_NAME", "com.victronenergy.solarcharger.anenji")
-PV_DEVICE_INSTANCE = int(os.environ.get("PV_DEVICE_INSTANCE", "4500"))
-PV_PRODUCT_ID      = int(os.environ.get("PV_PRODUCT_ID", "0xA067"), 0)
-PV_PRODUCT_NAME    = os.environ.get("PV_PRODUCT_NAME", "Anenji MPPT")
-
-
 ENERGY_FILE     = os.environ.get("ENERGY_FILE", os.path.join(BASE_DIR, "energy.json"))
 PV_PERSIST_FILE = os.environ.get("PV_PERSIST_FILE", os.path.join(BASE_DIR, "pv_today.json"))
+AC_LIMIT_FILE = os.environ.get("AC_LIMIT_FILE", os.path.join(BASE_DIR, "ac_limit.json"))
 ENERGY_SAVE_SEC = int(os.environ.get("ENERGY_SAVE_SEC", "60"))
 
 GRID_VOLTAGE_THRESHOLD = float(os.environ.get("GRID_VOLTAGE_THRESHOLD", "180.0"))
@@ -100,14 +105,16 @@ _energy = {
 }
 _last_energy_save = 0.0
 
-# pv today (Wh)
-_pv_today_wh = 0.0
-_pv_today_ts = int(time())
-_pv_max_power_today = 0.0
+# PV history (Wh) with midnight rollover + persistence (30 days)
+_pv_hist = {
+    "day": datetime.now().strftime("%Y-%m-%d"),
+    "today_wh": 0.0,
+    "yesterday_wh": 0.0,
+    "history_wh": [0.0] * 30
+}
 
 # debounce
 _last_grid_seen = 0.0
-_grid_confirmed = False
 
 # ---------- Fault & Warning bit maps (from your table) ----------
 FAULT_BITS = {
@@ -138,7 +145,6 @@ FAULT_BITS = {
     24: "Synchronization signal abnormal in the parallel system",
     25: "Reserve",
     26: "Parallel versions are incompatible",
-    # bits beyond 26 reserved/unknown
 }
 
 WARNING_BITS = {
@@ -161,7 +167,6 @@ WARNING_BITS = {
     16: "Parallel communication interrupted",
     17: "Output mode of Single and Parallel systems is inconsistent",
     18: "Battery voltage difference of parallel system is too large",
-    # beyond 18 unknown/reserved
 }
 
 # ---------- Helpers ----------
@@ -169,6 +174,44 @@ def mkdir_p(path):
     d = os.path.dirname(path)
     if d and not os.path.exists(d):
         os.makedirs(d, exist_ok=True)
+
+
+def load_ac_limit():
+    """Load persisted AC input current limit (amps)."""
+    try:
+        if os.path.exists(AC_LIMIT_FILE):
+            with open(AC_LIMIT_FILE, "r") as f:
+                data = json.load(f)
+            v = float(data.get("ac_current_limit", 0.0))
+            if v < 0:
+                v = 0.0
+            return v
+    except Exception as e:
+        log.warning("Could not load AC limit file %s: %s", AC_LIMIT_FILE, e)
+    return float(os.environ.get('AC_CURRENT_LIMIT_DEFAULT', '16'))
+
+def save_ac_limit(amps: float):
+    try:
+        mkdir_p(AC_LIMIT_FILE)
+        with open(AC_LIMIT_FILE, "w") as f:
+            json.dump({"ac_current_limit": float(amps)}, f)
+    except Exception as e:
+        log.warning("Could not save AC limit file %s: %s", AC_LIMIT_FILE, e)
+
+
+def _validate_ac_current_limit(amps) -> float:
+    """Reasonable clamp for AC input current limit in amps."""
+    try:
+        a = float(amps)
+    except Exception:
+        return 0.0
+    if a < 0:
+        a = 0.0
+    # clamp to something sane; change if needed
+    if a > 200:
+        a = 200.0
+    return a
+
 
 def safe_float(x, default=0.0):
     try:
@@ -206,25 +249,54 @@ def _save_energy():
     except Exception as e:
         log.error("Failed save energy: %s", e)
 
-def _load_pv_today():
-    global _pv_today_wh, _pv_today_ts
-    if os.path.exists(PV_PERSIST_FILE):
-        try:
-            with open(PV_PERSIST_FILE, "r") as f:
-                data = json.load(f)
-            _pv_today_wh = float(data.get("wh", 0.0))
-            _pv_today_ts = int(data.get("ts", int(time())))
-            log.info("Loaded PV today: %.3f kWh", _pv_today_wh / 1000.0)
-        except Exception as e:
-            log.debug("Failed load pv today: %s", e)
-
-def _save_pv_today():
+def _load_pv_history():
+    """Load PV history from PV_HISTORY_FILE. If old pv_today.json exists, migrate its value into today."""
+    global _pv_hist
     try:
-        mkdir_p(PV_PERSIST_FILE)
-        with open(PV_PERSIST_FILE, "w") as f:
-            json.dump({"wh": _pv_today_wh, "ts": _pv_today_ts}, f)
+        if os.path.exists(PV_HISTORY_FILE):
+            with open(PV_HISTORY_FILE, "r") as f:
+                d = json.load(f)
+            if isinstance(d, dict):
+                _pv_hist["day"] = str(d.get("day", _pv_hist["day"]))
+                _pv_hist["today_wh"] = float(d.get("today_wh", 0.0))
+                _pv_hist["yesterday_wh"] = float(d.get("yesterday_wh", 0.0))
+                h = d.get("history_wh", _pv_hist["history_wh"])
+                if isinstance(h, list) and len(h) > 0:
+                    _pv_hist["history_wh"] = [float(x) for x in h[:30]] + [0.0] * max(0, 30 - len(h[:30]))
+        elif os.path.exists(PV_PERSIST_FILE):
+            # migrate legacy pv_today.json
+            with open(PV_PERSIST_FILE, "r") as f:
+                d = json.load(f)
+            _pv_hist["day"] = datetime.now().strftime("%Y-%m-%d")
+            _pv_hist["today_wh"] = float(d.get("wh", 0.0))
+        log.info("Loaded PV history: today=%.3f kWh yesterday=%.3f kWh",
+                 _pv_hist["today_wh"]/1000.0, _pv_hist["yesterday_wh"]/1000.0)
     except Exception as e:
-        log.debug("Failed save pv today: %s", e)
+        log.warning("Failed load PV history: %s", e)
+
+def _save_pv_history():
+    try:
+        mkdir_p(PV_HISTORY_FILE)
+        with open(PV_HISTORY_FILE, "w") as f:
+            json.dump(_pv_hist, f)
+    except Exception as e:
+        log.debug("Failed save PV history: %s", e)
+
+def _pv_midnight_rollover_if_needed():
+    """Rollover today->yesterday at local midnight (calendar-based)."""
+    global _pv_hist
+    today = datetime.now().strftime("%Y-%m-%d")
+    if _pv_hist.get("day") != today:
+        _pv_hist["yesterday_wh"] = float(_pv_hist.get("today_wh", 0.0))
+        hist = _pv_hist.get("history_wh", [0.0]*1)
+        if not isinstance(hist, list):
+            hist = [0.0]*1
+        hist = [float(_pv_hist["yesterday_wh"])] + [float(x) for x in hist[:29]]
+        _pv_hist["history_wh"] = hist[:1]
+        _pv_hist["today_wh"] = 0.0
+        _pv_hist["max_power_today"] = 0
+        _pv_hist["day"] = today
+        _save_pv_history()
 
 # ---------- Modbus helpers ----------
 def mk_instrument():
@@ -249,7 +321,6 @@ def r16_block_as_ascii(inv, start_reg, count):
     for i in range(count):
         try:
             v = inv.read_register(start_reg + i, 0, functioncode=3, signed=False)
-            # each register contains two ASCII chars in high+low bytes
             hi = (v >> 8) & 0xFF
             lo = v & 0xFF
             if hi != 0:
@@ -283,7 +354,6 @@ def try_write_register(reg_env, value, decimals=0):
 
 # ---------- Fault & warning decode ----------
 def decode_bitfield_32(low_reg, high_reg):
-    """Combine two 16-bit registers into a 32-bit int; low_reg, high_reg are integers."""
     return (high_reg << 16) | (low_reg & 0xFFFF)
 
 def decode_faults_from_32bit(val32):
@@ -312,7 +382,7 @@ def _validate_output_voltage(v):
 def _validate_frequency(hz):
     return max(SAFETY_MIN_FREQ, min(SAFETY_MAX_FREQ, hz))
 
-# ---------- Control high-level functions (map to registers listed) ----------
+# ---------- Control high-level functions ----------
 def inverter_remote_on(inv):
     try:
         w16(inv, 420, 1)
@@ -413,14 +483,14 @@ class MultiPlusEmuService:
         self.bus_vebus = SystemBus()
         self.bus_pv = SystemBus()
         self.svc = VeDbusService(SERVICE_NAME, bus=self.bus_vebus)
-        # SolarCharger service on separate bus connection
         self.pv = VeDbusService(PV_SERVICE_NAME, bus=self.bus_pv)
         self._idx = 0
+        self._ac_current_limit = load_ac_limit()
         self._add_paths()
         self._add_pv_paths()
         self._last_modbus_ok = True
         self._consecutive_modbus_failures = 0
-        log.info("Started Anenji emulator: %s and %s", SERVICE_NAME, PV_SERVICE_NAME)
+        log.info("Started Anenji VE.Bus emulator: %s", SERVICE_NAME)
 
     def _add_paths(self):
         s = self.svc
@@ -443,11 +513,14 @@ class MultiPlusEmuService:
         s.add_path("/VebusChargeState", 0)
         s.add_path("/UpdateIndex", 0)
 
-        # AC Input
+        # AC ActiveIn (still publish)
         s.add_path("/Ac/ActiveIn/Connected", 0)
         s.add_path("/Ac/ActiveIn/ActiveInput", 240)
         s.add_path("/Ac/ActiveIn/Available", 1)
         s.add_path("/Ac/ActiveIn/Source", 1)
+
+        # AC input current limit (editable from Venus UI)
+        s.add_path("/Ac/ActiveIn/CurrentLimit", self._ac_current_limit, writeable=True, onchangecallback=self._on_change_ac_current_limit)
 
         s.add_path("/Ac/ActiveIn/L1/V", None, gettextcallback=lambda p,v: f"{v:.1f} V" if v is not None else "")
         s.add_path("/Ac/ActiveIn/L1/I", None, gettextcallback=lambda p,v: f"{v:.2f} A" if v is not None else "")
@@ -461,6 +534,26 @@ class MultiPlusEmuService:
         s.add_path("/Ac/ActiveIn/Power", None)
         s.add_path("/Ac/ActiveIn/S", None)
         s.add_path("/Ac/ActiveIn/Frequency", None)
+
+        # ---- AC In 1 (VRM Grid tile reads these) ----
+        s.add_path("/Ac/In/1/Connected", 0)
+        s.add_path("/Ac/In/1/CurrentLimit", self._ac_current_limit, writeable=True, onchangecallback=self._on_change_ac_current_limit)
+        s.add_path("/Ac/In/1/CurrentLimitIsAdjustable", 1)
+        s.add_path("/Ac/ActiveIn/CurrentLimitIsAdjustable", 1)
+        s.add_path("/Settings/GridCurrentLimitIsAdjustable", 1)
+
+        s.add_path("/Ac/In/1/L1/V", None)
+        s.add_path("/Ac/In/1/L1/I", None)
+        s.add_path("/Ac/In/1/L1/F", None)
+        s.add_path("/Ac/In/1/L1/P", None)
+        s.add_path("/Ac/In/1/L1/S", None)
+        s.add_path("/Ac/In/1/L1/PF", None)
+
+        s.add_path("/Ac/In/1/V", None)
+        s.add_path("/Ac/In/1/Current", None)
+        s.add_path("/Ac/In/1/Power", None)
+        s.add_path("/Ac/In/1/S", None)
+        s.add_path("/Ac/In/1/Frequency", None)
 
         # AC Out
         s.add_path("/Ac/Out/L1/V", None, gettextcallback=lambda p,v: f"{v:.1f} V" if v is not None else "")
@@ -481,7 +574,7 @@ class MultiPlusEmuService:
         s.add_path("/Soc", None, gettextcallback=lambda p,v: f"{v} %")
         s.add_path("/Dc/0/Temperature", None)
 
-        # PV
+        # PV (VE.Bus display only)
         s.add_path("/Pv/0/Power", 0.0, gettextcallback=lambda p,v: f"{v} W")
         s.add_path("/Pv/0/Voltage", None)
         s.add_path("/Pv/0/Current", None)
@@ -494,7 +587,7 @@ class MultiPlusEmuService:
         s.add_path("/Energy/ToGrid", _energy["ToGrid_kWh"])
         s.add_path("/Energy/FromGrid", _energy["FromGrid_kWh"])
 
-        # Faults/warnings (expose decoded strings)
+        # Faults/warnings
         s.add_path("/Faults/Code32", 0)
         s.add_path("/Faults/Decoded", "")
         s.add_path("/Warnings/Code32", 0)
@@ -503,57 +596,71 @@ class MultiPlusEmuService:
         # Controls (writeable)
         s.add_path("/Settings/ChargeEnabled", 1, writeable=True, onchangecallback=self._on_change_charge_enabled)
         s.add_path("/Settings/MaxChargeCurrent", 0, writeable=True, onchangecallback=self._on_change_max_charge_current)
+        s.add_path("/Settings/InverterEnabled", 1, writeable=True, onchangecallback=self._on_change_inverter_enabled)
+        s.add_path("/Settings/GridCurrentLimit", self._ac_current_limit, writeable=True, onchangecallback=self._on_change_ac_current_limit)
 
-    # ---- SolarCharger (PV) service paths ----
+        # Uptime
+        s.add_path("/Devices/0/UpTime", 0)
+
     def _add_pv_paths(self):
-        """Create the D-Bus paths required for Venus to show a SolarCharger/MPPT device."""
+        """Expose a Victron-like SolarCharger service so VRM/SystemCalc can count solar production."""
         p = self.pv
         p.add_path("/Mgmt/ProcessName", __file__)
         p.add_path("/Mgmt/ProcessVersion", FIRMWARE_VER)
         p.add_path("/Mgmt/Connection", ANENJI_PORT)
+
         p.add_path("/DeviceInstance", PV_DEVICE_INSTANCE)
         p.add_path("/ProductId", PV_PRODUCT_ID)
         p.add_path("/ProductName", PV_PRODUCT_NAME)
         p.add_path("/FirmwareVersion", FIRMWARE_VER)
+        p.add_path("/Serial", "")
         p.add_path("/Connected", 0)
-        p.add_path("/UpdateIndex", 0)
 
-        # Minimal set that makes Venus show an MPPT
-        p.add_path("/Pv/V", None, gettextcallback=lambda path, v: f"{v:.2f} V" if v is not None else "")
-        p.add_path("/Pv/I", None, gettextcallback=lambda path, v: f"{v:.2f} A" if v is not None else "")
-        p.add_path("/Pv/P", None, gettextcallback=lambda path, v: f"{v} W" if v is not None else "")
-        p.add_path("/Yield/Power", None, gettextcallback=lambda path, v: f"{v} W" if v is not None else "")
-        p.add_path("/Yield/Today", 0.0, gettextcallback=lambda path, v: f"{v:.3f} kWh")
-
-        # DC output (charger to battery)
-        p.add_path("/Dc/0/Voltage", None, gettextcallback=lambda path, v: f"{v:.2f} V" if v is not None else "")
-        p.add_path("/Dc/0/Current", None, gettextcallback=lambda path, v: f"{v:.2f} A" if v is not None else "")
-        p.add_path("/Dc/0/Power", None, gettextcallback=lambda path, v: f"{v} W" if v is not None else "")
-        # Battery temperature (VE.Can MPPTs only but harmless to expose)
-        p.add_path("/Dc/0/Temperature", None, gettextcallback=lambda path, v: f"{v:.1f} °C" if v is not None else "")
-
-        # Charger controls & status (common paths used by Venus)
-        p.add_path("/Mode", 1, writeable=True, onchangecallback=self._on_change_pv_mode)  # 1=On;4=Off
+        p.add_path("/Mode", 1)           # 1=On
+        p.add_path("/State", 1)          # 1=Idle
         p.add_path("/ErrorCode", 0)
-        p.add_path("/MppOperationMode", 255)
-        p.add_path("/Relay/0/State", 0)
 
-        # Equalization (mostly unused here)
-        p.add_path("/Equalization/Pending", 0)
-        p.add_path("/Equalization/TimeRemaining", 0)
+        p.add_path("/Pv/V", 0.0)
+        p.add_path("/Pv/I", 0.0)
 
-        # Daily history (used in some UIs)
-        p.add_path("/History/Daily/0/Yield", 0.0)      # kWh
-        p.add_path("/History/Daily/0/MaxPower", 0)     # W
-        p.add_path("/History/Daily/1/Yield", 0.0)      # kWh
-        p.add_path("/History/Daily/1/MaxPower", 0)     # W
+        p.add_path("/Dc/0/Voltage", 0.0)
+        p.add_path("/Dc/0/Current", 0.0)
+        p.add_path("/Dc/0/Power", 0.0)
 
-        p.add_path("/State", 0)
-        p.add_path("/Settings/InverterEnabled", 1, writeable=True, onchangecallback=self._on_change_inverter_enabled)
-        p.add_path("/Settings/GridCurrentLimit", 0, writeable=True, onchangecallback=self._on_change_grid_limit)
+        p.add_path("/Yield/Power", 0.0)
+        p.add_path("/Yield/Today", 0.0)
+        p.add_path("/Yield/User", 0.0)
+        p.add_path("/Yield/System", 0.0)
 
-        # Uptime
-        p.add_path("/Devices/0/UpTime", 0)
+
+# Full 30-day MPPT history (Victron style)
+       
+        for i in range(1):
+           base = f"/History/Daily/{i}"
+
+        p.add_path(f"{base}/Yield", 0.0)
+        p.add_path(f"{base}/MaxPower", 0.0)
+        p.add_path(f"{base}/MaxPvVoltage", 0.0)
+
+        p.add_path(f"{base}/MaxBatteryVoltage", 0.0)
+        p.add_path(f"{base}/MinBatteryVoltage", 0.0)
+        p.add_path(f"{base}/MaxBatteryCurrent", 0.0)
+
+        p.add_path(f"{base}/TimeInBulk", 0)
+        p.add_path(f"{base}/TimeInAbsorption", 0)
+        p.add_path(f"{base}/TimeInFloat", 0)
+
+        p.add_path(f"{base}/Consumption", 0.0)
+        p.add_path(f"{base}/Nr", 0)
+
+        p.add_path(f"{base}/LastError1", 0)
+        p.add_path(f"{base}/LastError2", 0)
+        p.add_path(f"{base}/LastError3", 0)
+        p.add_path(f"{base}/LastError4", 0)
+
+
+#        p.add_path("/History/Daily/0/Yield", 0.0)  # today
+ #       p.add_path("/History/Daily/1/Yield", 0.0)  # yesterday
 
     # ---------- D-Bus write handlers ----------
     def _on_set_mode(self, path, value):
@@ -578,7 +685,6 @@ class MultiPlusEmuService:
 
     def _on_change_charge_enabled(self, path, value):
         log.info("ChargeEnabled write: %s=%s", path, value)
-        # try env mapped register first
         if REG_MAP.get("CHARGE_ENABLE"):
             return try_write_register(REG_MAP["CHARGE_ENABLE"], int(bool(value)))
         try:
@@ -595,8 +701,7 @@ class MultiPlusEmuService:
     def _on_change_max_charge_current(self, path, value):
         log.info("MaxChargeCurrent write: %s=%s", path, value)
         try:
-            amps = float(value)
-            amps = _validate_charge_current(amps)
+            amps = _validate_charge_current(float(value))
             if REG_MAP.get("CHARGE_CURRENT"):
                 return try_write_register(REG_MAP["CHARGE_CURRENT"], amps, decimals=0)
             inv = mk_instrument()
@@ -618,23 +723,43 @@ class MultiPlusEmuService:
             log.error("Failed inverter enabled: %s", e)
             return False
 
-    
-    def _on_change_pv_mode(self, path, value):
-        """Write handler for PV charger /Mode (1=On, 4=Off). We don't control a real charger here,
-        so we just store the value and reflect it in /Connected and /State."""
+    def _on_change_ac_current_limit(self, path, value):
+        log.info("AC input current limit write: %s=%s", path, value)
         try:
-            v = int(value)
-        except Exception:
-            v = 1
-        # 1=On, 4=Off
-        if v == 4:
+            amps = _validate_ac_current_limit(value)
+
+            # Always accept the new limit so Venus UI remains editable.
+            # We still attempt to push it to the real device (if present),
+            # but a Modbus write failure should not make the setting read-only.
+            self._ac_current_limit = float(amps)
+            save_ac_limit(self._ac_current_limit)
+
+            # Keep related paths in sync for Venus UI
+            self.svc["/Settings/GridCurrentLimit"] = self._ac_current_limit
+            self.svc["/Ac/In/1/CurrentLimit"] = self._ac_current_limit
+            self.svc["/Ac/ActiveIn/CurrentLimit"] = self._ac_current_limit
+
+            pushed = False
             try:
-                self.pv["/Connected"] = 0
-            except Exception:
-                pass
-        return True
+                if REG_MAP.get("GRID_LIMIT"):
+                    pushed = try_write_register(REG_MAP["GRID_LIMIT"], amps, decimals=0)
+                else:
+                    inv = mk_instrument()
+                    pushed = inverter_set_utility_charge_current(inv, amps)
+            except Exception as e:
+                log.warning("Could not push AC current limit to inverter (keeping local value): %s", e)
+
+            if not pushed:
+                log.info("AC current limit stored locally (not pushed to inverter)")
+            return True
+        except Exception as e:
+            log.error("Failed set AC current limit: %s", e)
+            return False
 
     def _on_change_grid_limit(self, path, value):
+        # Backwards compatible alias
+        return self._on_change_ac_current_limit(path, value)
+
         log.info("GridCurrentLimit write: %s=%s", path, value)
         try:
             amps = float(value)
@@ -647,28 +772,13 @@ class MultiPlusEmuService:
             return False
 
     # ---------- main update ----------
-    def _safe_update(self):
-        try:
-            return self.update()
-        except Exception as e:
-            log.exception('Unhandled exception in update: %s', e)
-            return True
-
     def update(self):
-        global _energy, _pv_today_wh, _pv_today_ts, _last_grid_seen, _grid_confirmed
+        global _energy, _pv_hist, _last_grid_seen
 
         s = self.svc
-        # tick update index early (used as heartbeat)
-        self._idx = (getattr(self, '_idx', 0) + 1) % 256
-        s['/UpdateIndex'] = self._idx
-        try:
-            self.pv['/UpdateIndex'] = self._idx
-        except Exception:
-            pass
         try:
             inv = mk_instrument()
 
-            # READ registers per provided table
             # fault bits 100~101 (32-bit)
             fault_lo = r16(inv, 100)
             fault_hi = r16(inv, 101)
@@ -689,31 +799,36 @@ class MultiPlusEmuService:
             in_v = r16(inv, 202, True) * 0.1         # mains voltage
             in_f = r16(inv, 203, True) * 0.01        # mains frequency
             in_p = r16(inv, 204, True)               # average mains power (W)
-            inv_v = r16(inv, 205, True) * 0.1        # inverter voltage
-            inv_i_raw = r16(inv, 206, True) * 0.1    # inverter current (could be apparent)
+
+            inv_v = r16(inv, 205, True) * 0.1
+            inv_i_raw = r16(inv, 206, True) * 0.1
             inv_freq = r16(inv, 207, True) * 0.01
             inv_power = r16(inv, 208, True)
             inv_charge_power = r16(inv, 209, True)
 
-            out_v = r16(inv, 210, True) * 0.1        # output voltage
-            out_i_reg = r16(inv, 211, True) * 0.1 if True else None  # documented as effective current (but often apparent)
+            out_v = r16(inv, 210, True) * 0.1
+            out_i_reg = r16(inv, 211, True) * 0.1
             out_f = r16(inv, 212, True) * 0.01
             out_p = r16(inv, 213, True)
-            out_s = r16(inv, 214, True) if True else None
+            out_s = r16(inv, 214, True)
 
             bat_v = r16(inv, 215, True) * 0.1
             bat_i = r16(inv, 216, True) * 0.1
             bat_p = r16(inv, 217, True)
-            # PV registers
-            pv_v = None
-            pv_i = None
-            pv_p = 0.0
+
+            pv_v = pv_i = pv_p = None
             try:
                 pv_v = r16(inv, 219, True) * 0.1
-                pv_i = r16(inv, 220, True) * 0.1
-                pv_p = r16(inv, 223, True)
             except Exception:
-                pv_v = None; pv_i = None; pv_p = 0.0
+                pv_v = None
+            try:
+                pv_i = r16(inv, 220, True) * 0.1
+            except Exception:
+                pv_i = None
+            try:
+                pv_p = float(r16(inv, 223, True))
+            except Exception:
+                pv_p = None
 
             load_pct = r16(inv, 225, True)
             dcdc_temp = r16(inv, 226, True)
@@ -723,13 +838,11 @@ class MultiPlusEmuService:
             inv_chg_i = r16(inv, 233, True) * 0.1
             pv_chg_i = r16(inv, 234, True) * 0.1
 
-            # optional rated power
             try:
                 rated_power = r16(inv, 643)
             except Exception:
                 rated_power = INVERTER_MAX_POWER
 
-            # control/readable parameters (R/W) we will read to reflect state
             try:
                 output_mode = r16(inv, 300)
             except Exception:
@@ -739,14 +852,12 @@ class MultiPlusEmuService:
             except Exception:
                 output_priority = 0
 
-            # succeeded modbus
             self._consecutive_modbus_failures = 0
             if not self._last_modbus_ok:
                 log.info("Modbus restored")
             self._last_modbus_ok = True
 
         except Exception as e:
-            # modbus read fail - soft fail and leave connected=0
             self._consecutive_modbus_failures += 1
             self._last_modbus_ok = False
             log.error("Modbus read error: %s (count=%d)", e, self._consecutive_modbus_failures)
@@ -759,46 +870,6 @@ class MultiPlusEmuService:
 
         # Connected
         s["/Connected"] = 1
-        # ---- PV / SolarCharger publishing ----
-        try:
-            p = self.pv
-            p["/Connected"] = 1
-            p["/UpdateIndex"] = self._idx
-            # PV input
-            p["/Pv/V"] = float(pv_v) if pv_v is not None else 0.0
-            p["/Pv/I"] = float(pv_i) if pv_i is not None else 0.0
-            p["/Pv/P"] = float(pv_p) if pv_p is not None else 0.0
-
-            # Charger output (to battery). Use battery voltage and PV charge current if available.
-            p["/Dc/0/Voltage"] = float(bat_v) if bat_v is not None else 0.0
-            # pv_chg_i is the PV charge current into battery (from register 234). Fallback to 0.
-            p["/Dc/0/Current"] = float(pv_chg_i) if pv_chg_i is not None else 0.0
-            # Power: prefer pv_p; if missing, compute V*I
-            _pv_power = float(pv_p) if pv_p is not None else (float(pv_v or 0.0) * float(pv_i or 0.0))
-            p["/Dc/0/Power"] = _pv_power
-
-            # Yield power is what Venus systemcalc uses for totals
-            p["/Yield/Power"] = _pv_power
-            # Today's yield in kWh
-            p["/Yield/Today"] = float(_pv_today_wh) / 1000.0
-            # Track max power today
-            global _pv_max_power_today
-            if _pv_power > _pv_max_power_today:
-                _pv_max_power_today = _pv_power
-
-            # Daily history
-            p["/History/Daily/0/Yield"] = float(_pv_today_wh) / 1000.0
-            p["/History/Daily/0/MaxPower"] = int(_pv_max_power_today)
-            p["/History/Daily/1/Yield"] = 0.0
-            p["/History/Daily/1/MaxPower"] = 0
-
-            # Basic charger state/mpp mode
-            p["/MppOperationMode"] = 2 if _pv_power > 5 else 0
-            p["/State"] = 3 if _pv_power > 5 else 0
-            p["/ErrorCode"] = 0
-
-        except Exception:
-            pass
 
         # Mode / State mapping
         s["/Mode"] = (3 if wm == 3 else 1) if wm in (2,3,4,5) else 4
@@ -812,38 +883,33 @@ class MultiPlusEmuService:
         s["/Warnings/Code32"] = int(warn32)
         s["/Warnings/Decoded"] = "; ".join(warn_strs) if warn_strs else ""
 
-        # Grid detection debounce
-        raw_grid = (wm in (2,4,5)) or (in_v and in_v > GRID_VOLTAGE_THRESHOLD)
+        # ---- Grid detection based on AC-in voltage (AC IN 1) ----
         nowt = time()
+        raw_grid = (in_v is not None) and (in_v > GRID_VOLTAGE_THRESHOLD)
         if raw_grid:
             _last_grid_seen = nowt
-        if (nowt - _last_grid_seen) <= GRID_DEBOUNCE_SEC:
-            _grid_confirmed = True
-        else:
-            _grid_confirmed = False
-        mains_present = _grid_confirmed
+        mains_present = (nowt - _last_grid_seen) <= GRID_DEBOUNCE_SEC
 
+        # ActiveIn flags
+        # NOTE: These are Victron conventions used by SystemCalc/VRM.
+        # - /Ac/ActiveIn/Connected is a boolean (0/1)
+        # - /Ac/ActiveIn/ActiveInput is 0 for AC-in-1, 1 for AC-in-2, and 240 when not connected
         s["/Ac/ActiveIn/Connected"] = 1 if mains_present else 0
-        s["/Ac/ActiveIn/ActiveInput"] = 0 if mains_present else 240
+        s["/Ac/ActiveIn/ActiveInput"] = 0 if mains_present else 240  # AC IN 1 only
         s["/Ac/ActiveIn/Source"] = 1 if mains_present else 0
 
-        # Derive currents (Victron expects real current). Use P/V.
-        if out_v and abs(out_v) > 1e-6:
-            out_i = out_p / out_v
-        else:
-            out_i = 0.0
-        if in_v and abs(in_v) > 1e-6:
-            in_i = in_p / in_v
-        else:
-            in_i = 0.0
 
-        # apparent / S and PF
-        in_s_calc = in_v * in_i if in_v and in_i else 0.0
+        # Derive currents (Victron expects real current). Use P/V.
+        out_i = (out_p / out_v) if (out_v and abs(out_v) > 1e-6) else 0.0
+        in_i = (in_p / in_v) if (in_v and abs(in_v) > 1e-6) else 0.0
+
+        in_s_calc = in_v * in_i if (in_v and in_i) else 0.0
         in_pf = (in_p / in_s_calc) if in_s_calc > 0 else 0.0
-        out_s_calc = out_v * out_i if out_v and out_i else 0.0
+
+        out_s_calc = out_v * out_i if (out_v and out_i) else 0.0
         out_pf = (out_p / out_s_calc) if out_s_calc > 0 else 0.0
 
-        # Publish AC-in
+        # Publish AC ActiveIn
         s["/Ac/ActiveIn/L1/V"] = in_v
         s["/Ac/ActiveIn/L1/I"] = in_i
         s["/Ac/ActiveIn/L1/F"] = in_f
@@ -856,6 +922,22 @@ class MultiPlusEmuService:
         s["/Ac/ActiveIn/Power"] = in_p
         s["/Ac/ActiveIn/S"] = in_s_calc
         s["/Ac/ActiveIn/Frequency"] = in_f
+
+        # ---- Publish AC In 1 (VRM Grid tile uses this) ----
+        s["/Ac/In/1/Connected"] = 1 if mains_present else 0
+
+        s["/Ac/In/1/L1/V"] = in_v
+        s["/Ac/In/1/L1/I"] = in_i
+        s["/Ac/In/1/L1/F"] = in_f
+        s["/Ac/In/1/L1/P"] = in_p
+        s["/Ac/In/1/L1/S"] = in_s_calc
+        s["/Ac/In/1/L1/PF"] = round(in_pf, 3) if in_pf else None
+
+        s["/Ac/In/1/V"] = in_v
+        s["/Ac/In/1/Current"] = in_i
+        s["/Ac/In/1/Power"] = in_p
+        s["/Ac/In/1/S"] = in_s_calc
+        s["/Ac/In/1/Frequency"] = in_f
 
         # Publish AC-out
         s["/Ac/Out/L1/V"] = out_v
@@ -876,9 +958,154 @@ class MultiPlusEmuService:
         if dcdc_temp is not None:
             s["/Dc/0/Temperature"] = dcdc_temp
 
-        s["/Pv/0/Power"] = pv_p
+        s["/Pv/0/Power"] = float(pv_p) if pv_p is not None else 0.0
         s["/Pv/0/Voltage"] = pv_v
         s["/Pv/0/Current"] = pv_i
+
+        # ---- SolarCharger (MPPT) service export ----
+        _pv_midnight_rollover_if_needed()
+
+        if pv_p is not None and pv_p > 0:
+            _pv_hist["today_wh"] += float(pv_p) * (POLL_SEC / 3600.0)
+            if int(time()) % max(int(ENERGY_SAVE_SEC), 30) == 0:
+                _save_pv_history()
+
+        today_kwh = _pv_hist["today_wh"] / 1000.0
+        yday_kwh = _pv_hist["yesterday_wh"] / 1000.0
+
+        s["/Pv/0/Today"] = float(today_kwh)
+
+        pv_power = float(pv_p) if pv_p is not None else 0.0
+        bat_v_float = float(bat_v) if bat_v is not None else 0.0
+        dc_current = (pv_power / bat_v_float) if (pv_power > 0 and bat_v_float > 0.1) else 0.0
+
+        p = self.pv
+        p["/Connected"] = 1
+        p["/Mode"] = 1
+
+        p["/Pv/V"] = float(pv_v) if pv_v is not None else 0.0
+        p["/Pv/I"] = float(pv_i) if pv_i is not None else 0.0
+
+        p["/Dc/0/Voltage"] = bat_v_float
+        p["/Dc/0/Current"] = float(dc_current)
+        p["/Dc/0/Power"] = pv_power
+
+        p["/Yield/Power"] = pv_power
+        #p["/Yield/Today"] = float(round(today_kwh, 3))
+        #p["/History/Daily/0/Yield"] = float(round(today_kwh, 3))
+        #p["/History/Daily/1/Yield"] = float(round(yday_kwh, 3))
+        
+        p["/Yield/Today"] = float(round(today_kwh, 3))
+        p["/Yield/User"] = float(round(today_kwh, 3))
+        p["/Yield/System"] = float(round(today_kwh, 3))
+# ---- FULL HISTORY (Victron MPPT style) ----
+        for i in range(1):
+            try:
+                val = _pv_hist["history_wh"][i] / 1000.0
+            except:
+                val = 0.0
+
+        p[f"/History/Daily/{i}/Yield"] = float(round(val, 3))
+
+# Always override today/yesterday with live values
+        #["/History/Daily/0/Yield"] = float(round(today_kwh, 3))
+        #["/History/Daily/1/Yield"] = float(round(yday_kwh, 3))
+        
+        #["/History/Overall/Yield"] = sum(_pv_hist["history_wh"]) / 1000.0
+        #["/History/Overall/MaxPower"] = float(_pv_hist.get("max_power_today", 0))
+
+# ADD THIS BLOCK HERE 👇 
+        
+        hist = _pv_hist.get("history_wh", [])
+
+        max_p = float(_pv_hist.get("max_power_today", 0.0))
+        max_v = float(pv_v) if pv_v else 0.0
+
+        bat_v_float = float(bat_v) if bat_v else 0.0
+        bat_i_float = float(bat_i) if bat_i else 0.0
+
+        for i in range(1):
+            base = f"/History/Daily/{i}"
+
+            if i == 0:
+                yield_val = _pv_hist["today_wh"]
+                pwr = max_p
+                volt = max_v
+
+                max_bat_v = bat_v_float
+                min_bat_v = bat_v_float
+                max_bat_i = abs(bat_i_float)
+
+                bulk = 0
+                absorb = 0
+                flt = 0
+
+            elif i == 1:
+                yield_val = _pv_hist["yesterday_wh"]
+                pwr = 0.0
+                volt = 0.0
+
+                max_bat_v = 0.0
+                min_bat_v = 0.0
+                max_bat_i = 0.0
+
+                bulk = 0
+                absorb = 0
+                flt = 0
+
+            elif (i - 1) < len(hist):
+                yield_val = hist[i - 1]
+                pwr = 0.0
+                volt = 0.0
+
+                max_bat_v = 0.0
+                min_bat_v = 0.0
+                max_bat_i = 0.0
+
+                bulk = 0
+                absorb = 0
+                flt = 0
+
+            else:
+                yield_val = 0.0
+                pwr = 0.0
+                volt = 0.0
+
+                max_bat_v = 0.0
+                min_bat_v = 0.0
+                max_bat_i = 0.0
+
+                bulk = 0
+                absorb = 0
+                flt = 0
+
+        p[f"{base}/Yield"] = round(yield_val / 1000.0, 3)
+        p[f"{base}/MaxPower"] = pwr
+        p[f"{base}/MaxPvVoltage"] = volt
+
+        p[f"{base}/MaxBatteryVoltage"] = max_bat_v
+        p[f"{base}/MinBatteryVoltage"] = min_bat_v
+        p[f"{base}/MaxBatteryCurrent"] = max_bat_i
+
+        p[f"{base}/TimeInBulk"] = bulk
+        p[f"{base}/TimeInAbsorption"] = absorb
+        p[f"{base}/TimeInFloat"] = flt
+
+        p[f"{base}/Consumption"] = 0.0
+        p[f"{base}/Nr"] = i
+
+        p[f"{base}/LastError1"] = 0
+        p[f"{base}/LastError2"] = 0
+        p[f"{base}/LastError3"] = 0
+        p[f"{base}/LastError4"] = 0
+
+
+        if pv_power > 20:
+            p["/State"] = 3
+        elif pv_power > 5:
+            p["/State"] = 4
+        else:
+            p["/State"] = 1
 
         # Energy model
         dt = POLL_SEC
@@ -916,7 +1143,6 @@ class MultiPlusEmuService:
         if bat_p is not None:
             if bat_p > 50:
                 batt_to_load_w = max(batt_to_load_w, bat_p)
-                # ensure we don't count that as grid import
                 if grid_to_load_w > 0:
                     reduce_by = min(grid_to_load_w, max(0, bat_p - max(0, out_p - grid_to_load_w)))
                     grid_to_load_w = max(grid_to_load_w - reduce_by, 0)
@@ -934,9 +1160,6 @@ class MultiPlusEmuService:
                 grid_to_load_w = max(grid_to_load_w - pv_to_load, 0)
             else:
                 grid_to_batt_w = max(grid_to_batt_w - pv_to_batt, 0)
-            _pv_today_wh += pv_p * Wh
-            _pv_today_ts = int(time())
-            s["/Pv/0/Today"] = round(_pv_today_wh / 1000.0, 3)
 
         # export detection if in_p negative
         if in_p < -50:
@@ -950,23 +1173,6 @@ class MultiPlusEmuService:
         _energy["FromGrid_kWh"] += max(grid_to_load_w + grid_to_batt_w, 0) / 1000.0 * Wh
 
         _save_energy()
-        _save_pv_today()
-
-        # publish SolarCharger (MPPT)
-        try:
-            self.pv["/Connected"] = 1
-            self.pv["/Pv/V"] = pv_v
-            self.pv["/Pv/I"] = pv_i
-            self.pv["/Pv/P"] = int(pv_p) if pv_p is not None else None
-            self.pv["/Yield/Power"] = int(pv_p) if pv_p is not None else None
-            self.pv["/Yield/Today"] = round(_pv_today_wh / 1000.0, 3)
-            self.pv["/Dc/0/Voltage"] = bat_v
-            # positive current = charging into battery
-            self.pv["/Dc/0/Current"] = max(pv_chg_i or 0.0, 0.0)
-            self.pv["/Dc/0/Power"] = int(pv_p) if pv_p is not None else 0
-            self.pv["/State"] = 3 if pv_p is not None and pv_p > 0 else 0
-        except Exception as e:
-            log.debug("PV service update skipped: %s", e)
 
         # publish energy rounded
         s["/Energy/AcIn1ToInverter"] = round(_energy["AcIn1ToInverter_kWh"], 6)
@@ -975,8 +1181,10 @@ class MultiPlusEmuService:
         s["/Energy/ToGrid"] = round(_energy["ToGrid_kWh"], 6)
         s["/Energy/FromGrid"] = round(_energy["FromGrid_kWh"], 6)
 
-        # publish other housekeeping
+        # publish housekeeping
         s["/Devices/0/UpTime"] = int(time()) - time_driver_started
+        self._idx = (self._idx + 1) % 256
+        s["/UpdateIndex"] = self._idx
 
         return True
 
@@ -988,10 +1196,10 @@ def handle_sigterm(signum, frame):
 # ---------- main ----------
 def main():
     _load_energy()
-    _load_pv_today()
+    _load_pv_history()
     dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
     svc = MultiPlusEmuService()
-    GLib.timeout_add(int(POLL_SEC * 1000), svc._safe_update)
+    GLib.timeout_add(int(POLL_SEC * 1000), svc.update)
     signal.signal(signal.SIGTERM, handle_sigterm)
     signal.signal(signal.SIGINT, handle_sigterm)
     try:
@@ -1002,7 +1210,7 @@ def main():
     finally:
         log.info("Shutting down, saving state")
         _save_energy()
-        _save_pv_today()
+        _save_pv_history()
 
 if __name__ == "__main__":
     main()
