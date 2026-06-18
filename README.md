@@ -29,12 +29,12 @@ ls -l /dev/ttyUSB*
 
 Then edit the main emulator script:
 
-nano multiplus.py
+nano dbus-multiplus-emulator.py
 
 
 Default device is:
 
-/dev/ttyUSB1
+/dev/ttyUSB3
 
 
 Change this line to match your environment.
@@ -45,7 +45,7 @@ If you are also running dbus-serialbattery, you must prevent it from using the s
 
 In the serialbattery configuration, set:
 
-EXCLUDED_DEVICES = /dev/ttyUSB1
+EXCLUDED_DEVICES = /dev/ttyUSB3
 
 (Adjust the device tty if yours is different.)
 
@@ -66,10 +66,10 @@ Re-enable fans after battery / PV / AC are connected
 
 This ensures accurate DC voltage reporting.
 
-🌞 PV Input (Not Implemented Yet)
+🌞 PV Input Implemented
 
-The current version does not expose PV input data.
-If anyone has Modbus register details for the Anenji PV side, contributions are welcome.
+The current version does  expose PV input data.
+
 
 🧰 Hardware Setup
 
@@ -87,12 +87,12 @@ Inverter output	✅ Working
 AC input	✅ Working
 AC output	✅ Working
 DC voltage/current	⚠️ Inaccurate at startup (see notes)
-PV input	❌ Not implemented
-Control functions (on/off, charge, etc.)	❌ Not implemented
+PV input	✅ Working
+Control functions (on/off, charge, etc.)	✅ Working
 📄 Example Directory Structure
 /data/etc/dbus-anenji/
 │
-├── multiplus.py
+├── dbus-multiplus-emulator.py.py
 ├── settings.json
 ├── README.md
 └── other supporting scripts…
@@ -100,23 +100,24 @@ Control functions (on/off, charge, etc.)	❌ Not implemented
 🤝 Contributions
 
 Pull requests and register maps are welcome!
-The goal is to eventually support:
+The goal was to eventually support: - Fixed
 
-PV input - Work in progress
+PV input - Done
 
-Charge/Discharge control
+Charge/Discharge control - Done
 
-Full MultiPlus emulation
+Full MultiPlus emulation - Done
 
-Improved Modbus error handling
+Improved Modbus error handling - Fixed
 
 👤 Author
 
 Created by Marius.
+<img width="938" height="584" alt="image" src="https://github.com/user-attachments/assets/2b1713a1-158b-472d-a914-2b0cec45dbc8" />
+<img width="335" height="435" alt="image" src="https://github.com/user-attachments/assets/3934b29f-c232-4265-a20b-2978b525a3ca" />
 
-<img width="784" height="314" alt="image" src="https://github.com/user-attachments/assets/7164f96e-e199-419f-8bc2-9f34a1ec824a" />
-<img width="781" height="311" alt="image" src="https://github.com/user-attachments/assets/698b4820-7cbc-49e4-9ebb-b12cc18e8b68" />
-<img width="1306" height="823" alt="image" src="https://github.com/user-attachments/assets/9960e847-7421-4fc2-a99c-ef5e9bdee85c" />
-<img width="1069" height="469" alt="image" src="https://github.com/user-attachments/assets/d70246bb-2296-41d0-9a44-e3d8bee8e347" />
+<img width="1184" height="785" alt="image" src="https://github.com/user-attachments/assets/327eb5e1-afc0-44b3-950a-da313d2850ec" />
+<img width="977" height="532" alt="image" src="https://github.com/user-attachments/assets/359c90c2-e239-4959-9fe0-a778c8886533" />
+<img width="1028" height="602" alt="image" src="https://github.com/user-attachments/assets/a2345188-3fe4-4180-890d-3c091dc0d923" />
 
 
