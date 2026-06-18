@@ -105,6 +105,7 @@ The goal was to eventually support: - Fixed
 PV input - Done
 
 Charge/Discharge control - Done
+Charger only - Wrong naming Charges the battery and outputs power (Passtrough) 
 
 Full MultiPlus emulation - Done
 
@@ -119,5 +120,6 @@ Created by Marius.
 <img width="1184" height="785" alt="image" src="https://github.com/user-attachments/assets/327eb5e1-afc0-44b3-950a-da313d2850ec" />
 <img width="977" height="532" alt="image" src="https://github.com/user-attachments/assets/359c90c2-e239-4959-9fe0-a778c8886533" />
 <img width="1028" height="602" alt="image" src="https://github.com/user-attachments/assets/a2345188-3fe4-4180-890d-3c091dc0d923" />
+<img width="1109" height="735" alt="image" src="https://github.com/user-attachments/assets/b5eb1f7f-b2d1-4bb2-b8b5-c1ef9a29b3d1" />
 
 
